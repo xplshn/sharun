@@ -147,8 +147,6 @@ fn read_dotenv(working_dir: &str) {
                 env::set_var(key.trim(), expanded_value.as_ref());
             }
         }
-    } else {
-        eprintln!("No .env file found in the directory: {}", working_dir);
     }
 }
 
@@ -347,8 +345,6 @@ fn main() {
         env::remove_var("SHARUN_WORKING_DIR")
     }
 
-    add_to_env("PATH", bin_dir);
-
     let envs: Vec<CString> = env::vars()
         .map(|(key, value)| CString::new(
             format!("{}={}", key, value)
@@ -385,7 +381,13 @@ fn is_hardlink(file1: &Path, file2: &Path) -> Result<bool> {
 
 fn is_elf32(file_path: &str) -> Result<bool> {
     let mut file = File::open(file_path)?;
-    let mut buffer = [0u8; 4];
+    let mut buffer = [0u8; 6];
     file.read_exact(&mut buffer)?;
-    Ok(buffer == [0x7f, 0x45, 0x4c, 0x46])
+
+    // Check the ELF magic number and class
+    if &buffer[0..4] == b"\x7fELF" {
+        Ok(buffer[4] == 1) // ELFCLASS32
+    } else {
+        Ok(false)
+    }
 }
