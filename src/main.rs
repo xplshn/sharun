@@ -1,7 +1,5 @@
 use std::{
-    env, fs, io,
-    str::FromStr,
-    collections::HashSet,
+    env, fs,
     path::{Path, PathBuf},
     process::{Command, Stdio, exit},
     io::{Read, Result, Error, Write},
@@ -11,8 +9,17 @@ use std::{
 
 use which::which;
 use walkdir::WalkDir;
+use std::ffi::CString;
+use std::borrow::Cow;
 
 const SHARUN_NAME: &str = env!("CARGO_PKG_NAME");
+
+fn expand_env_variables(input: &str) -> Cow<'_, str> {
+    shellexpand::env(input).unwrap_or_else(|err| {
+        eprintln!("Failed to expand environment variable: {err}");
+        Cow::Borrowed(input)
+    })
+}
 
 fn get_interpreter(library_path: &str) -> Result<PathBuf> {
     let mut interpreters = Vec::new();
@@ -131,7 +138,23 @@ fn print_usage() {
     env!("CARGO_PKG_DESCRIPTION"));
 }
 
+fn read_dotenv(working_dir: &str) {
+    let dotenv_path = Path::new(working_dir).join(".env");
+    if let Ok(contents) = fs::read_to_string(&dotenv_path) {
+        for line in contents.lines().filter(|line| !line.trim().is_empty() && !line.starts_with('#')) {
+            if let Some((key, value)) = line.split_once('=') {
+                let expanded_value = expand_env_variables(value.trim());
+                env::set_var(key.trim(), expanded_value.as_ref());
+            }
+        }
+    } else {
+        eprintln!("No .env file found in the directory: {}", working_dir);
+    }
+}
+
 fn main() {
+    let lib4bin = include_bytes!("../lib4bin");
+
     let sharun: PathBuf = env::current_exe().unwrap();
     let mut exec_args: Vec<String> = env::args().collect();
 
@@ -150,24 +173,219 @@ fn main() {
     let shared_lib = format!("{shared_dir}/lib");
     let shared_lib32 = format!("{shared_dir}/lib32");
 
-    if exec_args.is_empty() {
-        print_usage();
-        return;
-    }
+    let arg0 = PathBuf::from(exec_args.remove(0));
+    let arg0_name = arg0.file_name().unwrap();
+    let arg0_dir = PathBuf::from(dirname(arg0.to_str().unwrap())).canonicalize()
+        .unwrap_or_else(|_|{
+            if let Ok(which_arg0) = which(arg0_name) {
+                which_arg0.parent().unwrap().to_path_buf()
+            } else {
+                eprintln!("Failed to find ARG0 dir!");
+                exit(1)
+            }
+    });
+    let arg0_path = arg0_dir.join(arg0_name);
 
-    let command = exec_args.remove(0);
-    if command == "-h" || command == "--help" {
-        print_usage();
-    } else if command == "-v" || command == "--version" {
-        println!("v{}", env!("CARGO_PKG_VERSION"));
-    } else if command == "-g" || command == "--gen-lib-path" {
-        for mut library_path in [shared_lib, shared_lib32] {
-            if Path::new(&library_path).exists() {
-                let lib_path_file = &format!("{library_path}/lib.path");
-                gen_library_path(&mut library_path, lib_path_file)
+    let mut bin_name = if arg0_path.is_symlink() && arg0_path.canonicalize().unwrap() == sharun {
+        arg0_name.to_str().unwrap().into()
+    } else {
+        basename(sharun.file_name().unwrap().to_str().unwrap())
+    };
+
+    if bin_name == SHARUN_NAME {
+        if !exec_args.is_empty() {
+            match exec_args[0].as_str() {
+                "-v" | "--version" => {
+                    println!("v{}", env!("CARGO_PKG_VERSION"));
+                    return
+                }
+                "-h" | "--help" => {
+                    print_usage();
+                    return
+                }
+                "-g" | "--gen-lib-path" => {
+                    for mut library_path in [shared_lib, shared_lib32] {
+                        if Path::new(&library_path).exists() {
+                            let lib_path_file = &format!("{library_path}/lib.path");
+                            gen_library_path(&mut library_path, lib_path_file)
+                        }
+                    }
+                    return
+                }
+                "l" | "lib4bin" => {
+                    exec_args.remove(0);
+                    let cmd = Command::new("bash")
+                        .env("SHARUN", sharun)
+                        .envs(env::vars())
+                        .stdin(Stdio::piped())
+                        .arg("-s").arg("--")
+                        .args(exec_args)
+                        .spawn();
+                    match cmd {
+                        Ok(mut bash) => {
+                            bash.stdin.take().unwrap().write_all(lib4bin).unwrap_or_else(|err|{
+                                eprintln!("Failed to write lib4bin to bash stdin: {err}");
+                                exit(1)
+                            });
+                            exit(bash.wait().unwrap().code().unwrap())
+                        }
+                        Err(err) => {
+                            eprintln!("Failed to run bash: {err}");
+                            exit(1)
+                        }
+                    }
+                }
+                _ => {
+                    bin_name = exec_args.remove(0);
+                    let bin_path = PathBuf::from(bin_dir).join(&bin_name);
+                    if is_exe(&bin_path).unwrap_or(false) &&
+                        (is_hardlink(&sharun, &bin_path).unwrap_or(false) ||
+                        !Path::new(&shared_bin).join(&bin_name).exists())
+                    {
+                        add_to_env("PATH", bin_dir);
+                        let err = Command::new(&bin_path)
+                            .envs(env::vars())
+                            .args(exec_args)
+                            .exec();
+                        eprintln!("Failed to run: {}: {err}", bin_path.display());
+                        exit(1)
+                    }
+                }
+            }
+        } else {
+            eprintln!("Specify the executable from: '{bin_dir}'");
+            if let Ok(dir) = Path::new(bin_dir).read_dir() {
+                for bin in dir.flatten() {
+                    if is_exe(&bin.path()).unwrap_or(false) {
+                        println!("{}", bin.file_name().to_str().unwrap())
+                    }
+                }
+            }
+            exit(1)
+        }
+    } else if bin_name == "AppRun" {
+        let appname_file = &format!("{sharun_dir}/.app");
+        let mut appname: String = "".into();
+        if !Path::new(appname_file).exists() {
+            if let Ok(dir) = Path::new(&sharun_dir).read_dir() {
+                for entry in dir.flatten() {
+                    let path = entry.path();
+                    if path.is_file() {
+                        let name = entry.file_name();
+                        let name = name.to_str().unwrap();
+                        if name.ends_with(".desktop") {
+                            let data = read_to_string(path).unwrap_or_else(|err|{
+                                eprintln!("Failed to read desktop file: {name}: {err}");
+                                exit(1)
+                            });
+                            appname = data.split("\n").filter_map(|string| {
+                                if string.starts_with("Exec=") {
+                                    Some(string.replace("Exec=", "").split_whitespace().next().unwrap_or("").into())
+                                } else {None}
+                            }).next().unwrap_or_else(||"".into())
+                        }
+                    }
+                }
             }
         }
-    } else {
-        eprintln!("Unrecognized command: {}", command);
+
+        if appname.is_empty() {
+            appname = read_to_string(appname_file).unwrap_or_else(|err|{
+                eprintln!("Failed to read .app file: {appname_file}: {err}");
+                exit(1)
+            })
+        }
+
+        if let Some(name) = appname.trim().split("\n").next() {
+            appname = basename(name)
+            .replace("'", "").replace("\"", "")
+        } else {
+            eprintln!("Failed to get app name: {appname_file}");
+            exit(1)
+        }
+        let app = &format!("{bin_dir}/{appname}");
+
+        add_to_env("PATH", bin_dir);
+        if get_env_var("ARGV0").is_empty() {
+            env::set_var("ARGV0", &arg0)
+        }
+        env::set_var("APPDIR", &sharun_dir);
+
+        let err = Command::new(app)
+            .envs(env::vars())
+            .args(exec_args)
+            .exec();
+        eprintln!("Failed to run App: {app}: {err}");
+        exit(1)
     }
+    let bin = format!("{shared_bin}/{bin_name}");
+
+    let is_elf32_bin = is_elf32(&bin).unwrap_or_else(|err|{
+        eprintln!("Failed to check ELF class: {bin}: {err}");
+        exit(1)
+    });
+
+    let library_path = if is_elf32_bin {
+        shared_lib32
+    } else {
+        shared_lib
+    };
+
+    read_dotenv(&sharun_dir);
+
+    let interpreter = get_interpreter(&library_path).unwrap_or_else(|_|{
+        eprintln!("Interpreter not found!");
+        exit(1)
+    });
+
+    let working_dir = &get_env_var("SHARUN_WORKING_DIR");
+    if !working_dir.is_empty() {
+        env::set_current_dir(working_dir).unwrap_or_else(|err|{
+            eprintln!("Failed to change working directory: {working_dir}: {err}");
+            exit(1)
+        });
+        env::remove_var("SHARUN_WORKING_DIR")
+    }
+
+    add_to_env("PATH", bin_dir);
+
+    let envs: Vec<CString> = env::vars()
+        .map(|(key, value)| CString::new(
+            format!("{}={}", key, value)
+        ).unwrap()).collect();
+
+    let mut interpreter_args = vec![
+        CString::new(interpreter.to_string_lossy().into_owned()).unwrap(),
+        CString::new("--library-path").unwrap(),
+        CString::new(library_path).unwrap(),
+        CString::new(bin).unwrap()
+    ];
+    for arg in exec_args {
+        interpreter_args.push(CString::new(arg).unwrap())
+    }
+
+    userland_execve::exec(
+        interpreter.as_path(),
+        &interpreter_args,
+        &envs,
+    )
+}
+
+fn add_to_env(key: &str, value: &str) {
+    let current_value = env::var(key).unwrap_or_default();
+    let new_value = format!("{}:{}", value, current_value);
+    env::set_var(key, new_value);
+}
+
+fn is_hardlink(file1: &Path, file2: &Path) -> Result<bool> {
+    let metadata1 = fs::metadata(file1)?;
+    let metadata2 = fs::metadata(file2)?;
+    Ok(metadata1.ino() == metadata2.ino() && metadata1.dev() == metadata2.dev())
+}
+
+fn is_elf32(file_path: &str) -> Result<bool> {
+    let mut file = File::open(file_path)?;
+    let mut buffer = [0u8; 4];
+    file.read_exact(&mut buffer)?;
+    Ok(buffer == [0x7f, 0x45, 0x4c, 0x46])
 }

@@ -23,4 +23,5 @@ opt-level = 0
 which = "7.0.0"
 walkdir = "2.5.0"
 userland-execve = "0.2.0"
+shellexpand = "3.0"
 dotenv = { git = "https://github.com/VHSgunzo/dotenv.git" }
